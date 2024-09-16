@@ -1,0 +1,6 @@
+env: "prod"
+http_server:
+  host: "127.0.0.1"
+  port: "8080"
+  timeout: 2s
+  idle_timeout: 45s

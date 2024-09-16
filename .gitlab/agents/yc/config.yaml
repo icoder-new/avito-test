@@ -1,0 +1,3 @@
+ci_access:
+  groups:
+    - id: avito-testirovanie-na-backend-1270

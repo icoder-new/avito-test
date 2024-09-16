@@ -1,0 +1,153 @@
+variables:
+  CALLBACK_URL: "https://codenrock.com/api/gitlab/check"
+  CONTEXT:  avito-testirovanie-na-backend-1270/ci-build-6105:yc
+  DOMAIN: avito2024.codenrock.com
+
+stages:
+  - build
+  - deploy
+
+build:
+  stage: build
+  image: docker:27.0.3-dind
+  services:
+    - docker:27.0.3-dind
+  before_script:
+    - mkdir -pv ${HOME}/.docker
+    - cp -vf  $YCR_DOCKER_CONFIG_JSON ${HOME}/.docker/config.json
+    - chmod 0600 ${HOME}/.docker/config.json
+    - sleep 20
+    - docker info
+  variables:
+     DOCKER_HOST: tcp://docker:2375
+     DOCKER_TLS_CERTDIR: ""
+  only:
+    - main
+    - master
+  script:
+    - docker build . -f ./Dockerfile -t ${CI_REGISTRY_IMAGE}:$CI_COMMIT_SHA
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker push ${CI_REGISTRY_IMAGE}:$CI_COMMIT_SHA
+  tags:
+    - runner
+    - build
+    - k8s
+
+deploy:
+  environment:
+    name: production
+    url: https://$KUBE_NAMESPACE-$CI_PROJECT_NAMESPACE_ID.$DOMAIN
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: ['']
+  stage: deploy
+  only:
+    - main
+    - master
+  script:
+    - export KUBE_NAMESPACE=$(echo $CI_PROJECT_DIR|sed 's/.*\/\(.*\)\/.*/\1/')
+    - export HOST_NAME=$KUBE_NAMESPACE-$CI_PROJECT_NAMESPACE_ID.$DOMAIN
+    - if [ "$KUBE_NAMESPACE" == "" ]; then echo "Namespace is not configured"; exit 1; fi
+    - echo "URL https://$HOST_NAME"
+    - kubectl config get-contexts
+    - kubectl config use-context $CONTEXT
+    - kubectl create ns $KUBE_NAMESPACE || true
+    - kubectl -n default get secret avito2024-tls -o yaml|sed 's/  namespace:.*//g'|sed 's/  uid:.*//g'|sed 's/  resourceVersion:.*//g'|sed 's/  creationTimestamp:.*//g' | kubectl apply --namespace $KUBE_NAMESPACE -f -
+    - kubectl -n default get secret regcred -o yaml|sed 's/  namespace:.*//g'|sed 's/  uid:.*//g'|sed 's/  resourceVersion:.*//g'|sed 's/  creationTimestamp:.*//g' | kubectl apply --namespace $KUBE_NAMESPACE -f -
+    - |
+      cat <<EOF | kubectl -n $KUBE_NAMESPACE apply -f -
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: $KUBE_NAMESPACE-backend
+        annotations:
+          app.gitlab.com/app: $CI_PROJECT_PATH_SLUG
+          app.gitlab.com/env: $CI_ENVIRONMENT_SLUG
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: $KUBE_NAMESPACE-backend
+        template:
+          metadata:
+            labels:
+              app: $KUBE_NAMESPACE-backend
+            annotations:
+              app.gitlab.com/app: $CI_PROJECT_PATH_SLUG
+              app.gitlab.com/env: $CI_ENVIRONMENT_SLUG
+          spec:
+            imagePullSecrets:
+              - name: regcred
+            containers:
+              - name: $KUBE_NAMESPACE
+                image: ${CI_REGISTRY_IMAGE}:$CI_COMMIT_SHA
+                imagePullPolicy: Always
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "256M"
+                env:
+                - name: POSTGRES_CONN
+                  value: "postgres://$KUBE_NAMESPACE:$KUBE_NAMESPACE@rc1b-5xmqy6bq501kls4m.mdb.yandexcloud.net:6432/$KUBE_NAMESPACE"
+                - name: POSTGRES_JDBC_URL
+                  value: "jdbc:postgresql://rc1b-5xmqy6bq501kls4m.mdb.yandexcloud.net:6432/$KUBE_NAMESPACE"
+                - name: POSTGRES_USERNAME
+                  value: "$KUBE_NAMESPACE"
+                - name: POSTGRES_PASSWORD
+                  value: "$KUBE_NAMESPACE"
+                - name: POSTGRES_HOST
+                  value: "rc1b-5xmqy6bq501kls4m.mdb.yandexcloud.net"
+                - name: POSTGRES_PORT
+                  value: "6432"
+                - name: POSTGRES_DATABASE
+                  value: "$KUBE_NAMESPACE"
+                - name: SERVER_ADDRESS
+                  value: "0.0.0.0:8080"
+                ports:
+                  - containerPort: 8080
+                    protocol: TCP
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ${KUBE_NAMESPACE}-backend
+      spec:
+        selector:
+          app: ${KUBE_NAMESPACE}-backend
+        ports:
+          - protocol: TCP
+            port: 8080
+            targetPort: 8080
+      ---
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: $KUBE_NAMESPACE-backend
+        annotations:
+          kubernetes.io/ingress.class: nginx
+          cert-manager.io/cluster-issuer: "letsencrypt"
+          nginx.ingress.kubernetes.io/ssl-redirect: "false"
+          nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+      spec:
+        tls:
+        - hosts:
+          - $HOST_NAME
+          secretName: avito2024-tls
+        rules:
+        - host: $HOST_NAME
+          http:
+            paths:
+            - path: /
+              pathType: ImplementationSpecific
+              backend:
+                service:
+                  name: $KUBE_NAMESPACE-backend
+                  port:
+                    number: 8080
+      ---
+      EOF
+  tags:
+    - runner
+    - build
+    - k8s
